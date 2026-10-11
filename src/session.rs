@@ -105,6 +105,7 @@ pub struct Session {
     reply_text: String,
     parked: HashMap<String, Parked>,
     mid_turn: bool,
+    model: String,
     /// stdout EOF observed — drop from the pool after this drive call.
     dead: bool,
     prompt_seq: u64,
@@ -162,7 +163,7 @@ pub fn run_turn(
     let mut chosen: Option<String> = None;
     let mut resume_tail: Vec<Value> = Vec::new();
     'outer: for (key, s) in guard.iter() {
-        if !s.mid_turn || !prep.input.starts_with(&s.absorbed) {
+        if s.model != prep.model || !s.mid_turn || !prep.input.starts_with(&s.absorbed) {
             continue;
         }
         let region = &prep.input[s.absorbed.len()..];
@@ -182,7 +183,7 @@ pub fn run_turn(
     let mut tail: Vec<Value> = Vec::new();
     if chosen.is_none() {
         for (key, s) in guard.iter() {
-            if s.mid_turn {
+            if s.model != prep.model || s.mid_turn {
                 continue;
             }
             if let Ok((t, _undelivered)) = chat::continuation(
@@ -299,6 +300,7 @@ fn spawn_session(
         reply_text: String::new(),
         parked: HashMap::new(),
         mid_turn: false,
+        model: prep.model.clone(),
         dead: false,
         prompt_seq: 0,
         last_used: Instant::now(),

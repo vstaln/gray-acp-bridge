@@ -190,7 +190,12 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let effort = overrides
         .iter()
         .find(|(k, _)| k == "effort")
-        .map(|(_, v)| v.clone());
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            body.pointer("/reasoning/effort")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
 
     Ok(PreparedTurn {
         system,
