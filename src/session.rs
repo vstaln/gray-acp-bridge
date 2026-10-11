@@ -286,9 +286,8 @@ fn spawn_session(
         // Best-effort: some agents lack set_mode.
         let _ = client.set_mode(&session_id, mode);
     }
-    let (base, overrides) = chat::split_model_overrides(&prep.model);
-    if !base.is_empty() {
-        driver.apply_model(&mut client, &session_id, &sess, &base, prep.effort.as_deref(), &overrides)?;
+    if !prep.model.is_empty() {
+        driver.apply_model(&mut client, &session_id, &sess, &prep.model, prep.effort.as_deref(), &prep.overrides)?;
     }
     let _ = init;
     Ok(Session {

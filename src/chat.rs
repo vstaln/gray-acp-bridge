@@ -37,6 +37,9 @@ pub struct PreparedTurn {
     pub model: String,
     /// Reasoning effort parsed out of `model[effort=X]`, if present.
     pub effort: Option<String>,
+    /// `model[k=v]` bracket pairs (`effort` included — drivers decide
+    /// which keys they honor).
+    pub overrides: Vec<(String, String)>,
 }
 
 /// Strip `model[effort=high,fast=false]` bracket overrides; returns the
@@ -206,6 +209,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         tools,
         model: base,
         effort,
+        overrides,
     })
 }
 
