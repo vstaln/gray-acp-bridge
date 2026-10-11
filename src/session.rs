@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::acp::{AcpClient, SpawnSpec, Wire};
 use crate::chat::{self, OutItem, PreparedTurn, TurnResult};
+use crate::guard::{self, TurnGuard};
 use crate::mcp::{McpPark, PendingCall};
 
 const MAX_SESSIONS: usize = 4;
@@ -110,6 +111,7 @@ pub struct Session {
     dead: bool,
     prompt_seq: u64,
     last_used: Instant,
+    prior_cut: bool,
     _stage: tempfile::TempDir,
 }
 
@@ -303,6 +305,7 @@ fn spawn_session(
         dead: false,
         prompt_seq: 0,
         last_used: Instant::now(),
+        prior_cut: false,
         _stage: stage,
     })
 }
@@ -358,13 +361,32 @@ fn normalize_schema(schema: &mut Value) {
     }
 }
 
-/// Run/continue one turn on `session`.
 fn drive(
     session: &mut Session,
     driver: &dyn Driver,
     prep: &mut PreparedTurn,
     cancel: &AtomicBool,
     fresh: bool,
+) -> Result<TurnResult, String> {
+    let mut turn_guard = TurnGuard::default();
+    let mut r = drive_inner(session, driver, prep, cancel, fresh, &mut turn_guard)?;
+    guard::clean_items(&mut r.items);
+    if !session.mid_turn {
+        let (call_ids, text) = chat::reply_signature(&r);
+        session.reply_call_ids = call_ids;
+        session.reply_text = text;
+    }
+    Ok(r)
+}
+
+/// Run/continue one turn on `session`.
+fn drive_inner(
+    session: &mut Session,
+    driver: &dyn Driver,
+    prep: &mut PreparedTurn,
+    cancel: &AtomicBool,
+    fresh: bool,
+    turn_guard: &mut TurnGuard,
 ) -> Result<TurnResult, String> {
     let mut result = TurnResult::default();
     result.stop_reason = "end_turn".to_string();
@@ -405,9 +427,15 @@ fn drive(
     } else {
         // New prompt on this session.
         let mut prompt_blocks: Vec<Value> = Vec::new();
+        if std::mem::take(&mut session.prior_cut) && !fresh {
+            prompt_blocks.push(json!({"type": "text", "text": guard::CUT_NOTE}));
+        }
         if fresh && !prep.system.is_empty() {
             prompt_blocks.push(json!({"type": "text",
-                "text": format!("System instructions:\n{}", prep.system)}));
+                "text": format!("System instructions:\n{}\n\n{}", prep.system, guard::ONE_TURN_RULE)}));
+        } else if fresh {
+            prompt_blocks.push(json!({"type": "text",
+                "text": format!("System instructions:\n{}", guard::ONE_TURN_RULE)}));
         }
         if prep.tail_prompt.is_empty() && prep.outputs.is_empty() && !fresh {
             // Nothing new — nudge the model rather than send an empty prompt.
@@ -471,6 +499,10 @@ fn drive(
 
         // Parked MCP calls arrived?
         for pending in session.mcp.drain() {
+            if turn_guard.cut().is_some() {
+                pending.fail("reply was cut at a fabricated transcript record; this call never ran");
+                continue;
+            }
             flush_text(&mut result, &mut text_acc);
             let (call_id, name) = (pending.call_id.clone(), pending.name.clone());
             let arguments = pending.arguments.to_string();
@@ -575,8 +607,20 @@ fn drive(
             Wire::Bad => {}
             Wire::Notification { method, params } => {
                 if method == "session/update" {
-                    handle_update(&params, &mut result, &mut text_acc, &mut thought_acc,
-                                  &flush_text, &flush_thought);
+                    let cut = handle_update(&params, &mut result, &mut text_acc, &mut thought_acc,
+                                  &flush_text, &flush_thought, turn_guard);
+                    if let Some(m) = cut {
+                        eprintln!(
+                            "acp-bridge: reply cut at fabricated {} record (offset {}); {}",
+                            guard::marker_name(m),
+                            text_acc.len(),
+                            if session.parked.is_empty() { "upstream cancelled" } else { "draining (calls parked)" }
+                        );
+                        session.prior_cut = true;
+                        if session.parked.is_empty() {
+                            session.client.cancel(&session.session_id);
+                        }
+                    }
                     if !session.parked.is_empty() {
                         quiesce = Some(Instant::now());
                     }
@@ -674,16 +718,21 @@ fn handle_update(
     thought_acc: &mut String,
     flush_text: &dyn Fn(&mut TurnResult, &mut String),
     _flush_thought: &dyn Fn(&mut TurnResult, &mut String),
-) {
-    let update = match params.get("update") {
-        Some(u) => u,
-        None => return,
-    };
+    turn_guard: &mut TurnGuard,
+) -> Option<&'static str> {
+    let update = params.get("update")?;
     let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+    if turn_guard.cut().is_some() && kind != "usage_update" {
+        return None;
+    }
     match kind {
         "agent_message_chunk" => {
             if let Some(t) = content_text(update.get("content")) {
+                if text_acc.is_empty() {
+                    turn_guard.new_segment();
+                }
                 text_acc.push_str(&t);
+                return turn_guard.feed(text_acc);
             }
         }
         "agent_thought_chunk" => {
@@ -711,6 +760,7 @@ fn handle_update(
         | "config_option_update" | "session_info_update" | "user_message_chunk" => {}
         _ => {}
     }
+    None
 }
 
 fn content_text(content: Option<&Value>) -> Option<String> {
