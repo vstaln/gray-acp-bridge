@@ -298,7 +298,11 @@ pub fn split_tail(turn: &mut PreparedTurn) {
         } else if let Some(text) = item_to_transcript(item) {
             let mut t = text;
             if t.len() > MAX_TRANSCRIPT_CHARS {
-                t.truncate(MAX_TRANSCRIPT_CHARS);
+                let mut end = MAX_TRANSCRIPT_CHARS;
+                while !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                t.truncate(end);
                 t.push_str("\n[truncated]");
             }
             prompt.push(json!({"type": "text", "text": t}));
