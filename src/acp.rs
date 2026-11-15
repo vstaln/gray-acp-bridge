@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -25,7 +25,11 @@ const STDERR_RING: usize = 40;
 
 pub enum Wire {
     /// Agent→client request we must `respond` to. `id` is the raw JSON id.
-    Request { id: Value, method: String, params: Value },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// Agent→client notification (e.g. session/update, ext notifications).
     Notification { method: String, params: Value },
     /// Unparseable line — tolerated.
@@ -114,10 +118,7 @@ impl AcpClient {
                                     }
                                 }
                                 _ => {
-                                    if tx
-                                        .send(Wire::Notification { method, params })
-                                        .is_err()
-                                    {
+                                    if tx.send(Wire::Notification { method, params }).is_err() {
                                         return;
                                     }
                                 }
@@ -125,10 +126,7 @@ impl AcpClient {
                         } else if let Some(id) = v.get("id") {
                             // response to one of ours
                             let key = id_key(id);
-                            let sender = pending
-                                .lock()
-                                .ok()
-                                .and_then(|mut p| p.remove(&key));
+                            let sender = pending.lock().ok().and_then(|mut p| p.remove(&key));
                             if let Some(sender) = sender {
                                 let _ = sender.send(v);
                             }
@@ -137,7 +135,9 @@ impl AcpClient {
                     // drain pending + signal eof
                     if let Ok(mut p) = pending.lock() {
                         for (_, s) in p.drain() {
-                            let _ = s.send(json!({"error":{"code":-32000,"message":"agent stdout EOF"}}));
+                            let _ = s.send(
+                                json!({"error":{"code":-32000,"message":"agent stdout EOF"}}),
+                            );
                         }
                     }
                     let _ = tx.send(Wire::Eof);
@@ -182,10 +182,9 @@ impl AcpClient {
             let s = v.to_string();
             eprintln!("[acp->] {}", &s[..s.len().min(300)]);
         }
-        let mut guard = self
-            .stdin
-            .lock()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin lock poisoned"))?;
+        let mut guard = self.stdin.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin lock poisoned")
+        })?;
         let mut buf = serde_json::to_vec(v).map_err(std::io::Error::other)?;
         buf.push(b'\n');
         guard.write_all(&buf)?;
@@ -194,7 +193,12 @@ impl AcpClient {
 
     /// Send a request; returns the response's raw message. Caller matches
     /// on `result` / `error`. `rx_timeout` bounds the wait.
-    pub fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = mpsc::sync_channel::<Value>(1);
@@ -249,7 +253,11 @@ impl AcpClient {
             return Err(format!(
                 "{method} failed: {}{}{}",
                 base,
-                if detail.is_empty() { String::new() } else { format!(" — {detail}") },
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {detail}")
+                },
                 stderr_note,
             ));
         }
@@ -322,7 +330,12 @@ impl AcpClient {
         )
     }
 
-    pub fn session_load(&mut self, session_id: &str, cwd: &str, mcp_servers: Value) -> Result<Value, String> {
+    pub fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Value,
+    ) -> Result<Value, String> {
         self.call(
             "session/load",
             json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers}),
@@ -333,7 +346,12 @@ impl AcpClient {
     /// Kick off a prompt turn: registers the request then RETURNS the id —
     /// the caller streams `session/update` via `recv` until the matching
     /// response resolves (or a `_*/prompt_complete` notification wins).
-    pub fn prompt_begin(&mut self, session_id: &str, prompt: Value, meta: Value) -> Result<u64, String> {
+    pub fn prompt_begin(
+        &mut self,
+        session_id: &str,
+        prompt: Value,
+        meta: Value,
+    ) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
         let mut params = json!({"sessionId": session_id, "prompt": prompt});
@@ -341,7 +359,8 @@ impl AcpClient {
             params["_meta"] = meta;
         }
         let req = json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params});
-        self.write_line(&req).map_err(|e| format!("session/prompt write: {e}"))?;
+        self.write_line(&req)
+            .map_err(|e| format!("session/prompt write: {e}"))?;
         Ok(id)
     }
 
@@ -356,7 +375,12 @@ impl AcpClient {
     }
 
     /// Version that pre-registers then writes (race-free).
-    pub fn prompt(&mut self, session_id: &str, prompt: Value, meta: Value) -> Result<(u64, Receiver<Value>), String> {
+    pub fn prompt(
+        &mut self,
+        session_id: &str,
+        prompt: Value,
+        meta: Value,
+    ) -> Result<(u64, Receiver<Value>), String> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = mpsc::sync_channel::<Value>(1);
@@ -370,7 +394,10 @@ impl AcpClient {
         }
         let req = json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params});
         if let Err(e) = self.write_line(&req) {
-            self.pending.lock().ok().and_then(|mut p| p.remove(&id.to_string()));
+            self.pending
+                .lock()
+                .ok()
+                .and_then(|mut p| p.remove(&id.to_string()));
             return Err(format!("session/prompt write: {e}"));
         }
         Ok((id, rx))
@@ -380,7 +407,12 @@ impl AcpClient {
         let _ = self.notify("session/cancel", json!({"sessionId": session_id}));
     }
 
-    pub fn set_model(&mut self, session_id: &str, model_id: &str, meta: Value) -> Result<(), String> {
+    pub fn set_model(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+        meta: Value,
+    ) -> Result<(), String> {
         let mut params = json!({"sessionId": session_id, "modelId": model_id});
         if !meta.is_null() {
             params["_meta"] = meta;
@@ -389,7 +421,12 @@ impl AcpClient {
         Ok(())
     }
 
-    pub fn set_config_option(&mut self, session_id: &str, config_id: &str, value: Value) -> Result<(), String> {
+    pub fn set_config_option(
+        &mut self,
+        session_id: &str,
+        config_id: &str,
+        value: Value,
+    ) -> Result<(), String> {
         self.call(
             "session/set_config_option",
             json!({"sessionId": session_id, "configId": config_id, "value": value}),
@@ -409,7 +446,12 @@ impl AcpClient {
 
     /// Extension request the agent doesn't document (e.g. cursor's model
     /// list). Returns the raw result.
-    pub fn ext_call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn ext_call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         self.call(method, params, timeout)
     }
 
