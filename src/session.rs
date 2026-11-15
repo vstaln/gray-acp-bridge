@@ -29,8 +29,6 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const REAPER_TICK: Duration = Duration::from_secs(30);
 /// Budget for a single update wait while a turn streams.
 const UPDATE_WAIT: Duration = Duration::from_millis(250);
-/// Give a cancelled turn this long to settle.
-
 /// Everything a provider binary must supply.
 pub trait Driver: Send + Sync {
     /// `agent` argv/env for one staged child.
@@ -383,8 +381,10 @@ fn drive_inner(
     fresh: bool,
     turn_guard: &mut TurnGuard,
 ) -> Result<TurnResult, String> {
-    let mut result = TurnResult::default();
-    result.stop_reason = "end_turn".to_string();
+    let mut result = TurnResult {
+        stop_reason: "end_turn".to_string(),
+        ..TurnResult::default()
+    };
     let mut prompt_rx: Option<std::sync::mpsc::Receiver<Value>> = None;
     // User-side tail items that arrived while a turn was suspended get
     // queued as a follow-up prompt once the current one completes.
@@ -447,7 +447,7 @@ fn drive_inner(
             prompt_blocks.push(json!({"type": "text",
                 "text": format!("Tool result for {call_id}: {output}")}));
         }
-        if prompt_blocks.is_empty() && session.mid_turn == false {
+        if prompt_blocks.is_empty() && !session.mid_turn {
             // Nothing renderable — nudge rather than send an empty prompt
             // (which would hang the turn forever).
             prompt_blocks.push(json!({"type": "text", "text": "Continue."}));
@@ -776,7 +776,7 @@ fn handle_update(
             }
         }
         "usage_update" => {
-            if let Some(u) = update.get("usage").or_else(|| Some(update)) {
+            if let Some(u) = update.get("usage").or(Some(update)) {
                 if let Some(usage) = chat::Usage::from_acp(u) {
                     result.usage = Some(usage);
                 }

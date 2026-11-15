@@ -142,7 +142,7 @@ impl AcpClient {
                     }
                     let _ = tx.send(Wire::Eof);
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
         let stderr_ring = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING + 1)));

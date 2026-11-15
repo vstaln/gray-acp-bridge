@@ -64,10 +64,7 @@ pub fn split_model_overrides(model: &str) -> (String, Vec<(String, String)>) {
 
 fn item_type(item: &Value) -> &str {
     match item.get("type").and_then(Value::as_str) {
-        Some(t) => match t {
-            // Role-tagged messages in Responses input carry no `type`.
-            _ => t,
-        },
+        Some(t) => t,
         None if item.get("role").is_some() => "message",
         None => "",
     }
@@ -408,8 +405,7 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
             "created_at": now_secs(), "status": "in_progress",
             "model": model, "output": []}
     })));
-    let mut index = 0usize;
-    for item in &r.items {
+    for (index, item) in r.items.iter().enumerate() {
         match item {
             OutItem::Message { text } => {
                 let item_id = format!("msg_{response_id}_{index}");
@@ -470,7 +466,6 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
                 })));
             }
         }
-        index += 1;
     }
     let usage = r.usage.as_ref().map(|u| {
         json!({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
