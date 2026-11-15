@@ -45,6 +45,20 @@ pub struct SpawnSpec {
     pub cwd: PathBuf,
 }
 
+/// A failed request: the JSON-RPC error code when the agent sent one
+/// (`None` for transport failures and timeouts), plus the formatted message
+/// [`AcpClient::call`] has always returned.
+pub struct RpcFailure {
+    pub code: Option<i64>,
+    pub message: String,
+}
+
+impl RpcFailure {
+    fn new(code: Option<i64>, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
 pub struct AcpClient {
     pub child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -199,12 +213,25 @@ impl AcpClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.call_failure(method, params, timeout)
+            .map_err(|f| f.message)
+    }
+
+    /// [`AcpClient::call`] that keeps the JSON-RPC error code, so a driver
+    /// can tell a method-not-found (-32601) from a transport failure
+    /// without matching on message text.
+    pub fn call_failure(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcFailure> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = mpsc::sync_channel::<Value>(1);
         self.pending
             .lock()
-            .map_err(|_| "pending lock".to_string())?
+            .map_err(|_| RpcFailure::new(None, "pending lock".to_string()))?
             .insert(id.to_string(), tx);
         let req = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         if let Err(e) = self.write_line(&req) {
@@ -212,7 +239,7 @@ impl AcpClient {
                 .lock()
                 .ok()
                 .and_then(|mut p| p.remove(&id.to_string()));
-            return Err(format!("write {method}: {e}"));
+            return Err(RpcFailure::new(None, format!("write {method}: {e}")));
         }
         let msg = match rx.recv_timeout(timeout) {
             Ok(m) => m,
@@ -221,10 +248,11 @@ impl AcpClient {
                     .lock()
                     .ok()
                     .and_then(|mut p| p.remove(&id.to_string()));
-                return Err(format!("{method} timed out"));
+                return Err(RpcFailure::new(None, format!("{method} timed out")));
             }
         };
         if let Some(err) = msg.get("error") {
+            let code = err.get("code").and_then(Value::as_i64);
             let base = err.get("message").and_then(Value::as_str).unwrap_or("?");
             // Cursor/xAI put the useful string under data.details/data.message.
             let detail = match err.get("data") {
@@ -250,15 +278,18 @@ impl AcpClient {
             } else {
                 format!(" [stderr: {}]", tail.last().cloned().unwrap_or_default())
             };
-            return Err(format!(
-                "{method} failed: {}{}{}",
-                base,
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {detail}")
-                },
-                stderr_note,
+            return Err(RpcFailure::new(
+                code,
+                format!(
+                    "{method} failed: {}{}{}",
+                    base,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {detail}")
+                    },
+                    stderr_note,
+                ),
             ));
         }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
@@ -413,11 +444,23 @@ impl AcpClient {
         model_id: &str,
         meta: Value,
     ) -> Result<(), String> {
+        self.set_model_failure(session_id, model_id, meta)
+            .map_err(|f| f.message)
+    }
+
+    /// [`AcpClient::set_model`] that keeps the error code: an unusable
+    /// model id comes back as a JSON-RPC error the caller may classify.
+    pub fn set_model_failure(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+        meta: Value,
+    ) -> Result<(), RpcFailure> {
         let mut params = json!({"sessionId": session_id, "modelId": model_id});
         if !meta.is_null() {
             params["_meta"] = meta;
         }
-        self.call("session/set_model", params, Duration::from_secs(15))?;
+        self.call_failure("session/set_model", params, Duration::from_secs(15))?;
         Ok(())
     }
 
