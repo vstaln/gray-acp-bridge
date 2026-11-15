@@ -133,7 +133,12 @@ fn write_resp(s: &mut std::net::TcpStream, code: u16, body: &[u8]) {
     let _ = s.flush();
 }
 
-fn handle_conn(s: &mut std::net::TcpStream, intents: &Intents, bearer: &str, used: &Arc<AtomicBool>) {
+fn handle_conn(
+    s: &mut std::net::TcpStream,
+    intents: &Intents,
+    bearer: &str,
+    used: &Arc<AtomicBool>,
+) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(330)));
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
@@ -195,7 +200,11 @@ fn handle_conn(s: &mut std::net::TcpStream, intents: &Intents, bearer: &str, use
             "type": "invalid_request_error",
             "message": format!("relay body incomplete: read {} of {len} bytes (limit {MAX_BODY})", body.len()),
         }});
-        write_resp(s, if len > MAX_BODY { 413 } else { 400 }, body.to_string().as_bytes());
+        write_resp(
+            s,
+            if len > MAX_BODY { 413 } else { 400 },
+            body.to_string().as_bytes(),
+        );
         return;
     }
     if used.swap(true, Ordering::SeqCst) {
@@ -270,7 +279,8 @@ fn handle_conn(s: &mut std::net::TcpStream, intents: &Intents, bearer: &str, use
                         let failed = json!({"type": "response.failed",
                             "response": {"status": "failed",
                                 "error": {"code": "server_error", "message": detail}}});
-                        let _ = s.write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes());
+                        let _ =
+                            s.write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes());
                         let _ = s.flush();
                         return;
                     }
@@ -290,7 +300,12 @@ fn handle_conn(s: &mut std::net::TcpStream, intents: &Intents, bearer: &str, use
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], cancel: &Arc<AtomicBool>) -> Result<Vec<u8>, String> {
+fn run_turn(
+    intents: &Intents,
+    bearer: &str,
+    raw: &[u8],
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))

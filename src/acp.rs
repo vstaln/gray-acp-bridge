@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -25,7 +25,11 @@ const STDERR_RING: usize = 40;
 
 pub enum Wire {
     /// Agent→client request we must `respond` to. `id` is the raw JSON id.
-    Request { id: Value, method: String, params: Value },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// Agent→client notification (e.g. session/update, ext notifications).
     Notification { method: String, params: Value },
     /// Unparseable line — tolerated.
@@ -39,6 +43,20 @@ pub struct SpawnSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
+}
+
+/// A failed request: the JSON-RPC error code when the agent sent one
+/// (`None` for transport failures and timeouts), plus the formatted message
+/// [`AcpClient::call`] has always returned.
+pub struct RpcFailure {
+    pub code: Option<i64>,
+    pub message: String,
+}
+
+impl RpcFailure {
+    fn new(code: Option<i64>, message: String) -> Self {
+        Self { code, message }
+    }
 }
 
 pub struct AcpClient {
@@ -114,10 +132,7 @@ impl AcpClient {
                                     }
                                 }
                                 _ => {
-                                    if tx
-                                        .send(Wire::Notification { method, params })
-                                        .is_err()
-                                    {
+                                    if tx.send(Wire::Notification { method, params }).is_err() {
                                         return;
                                     }
                                 }
@@ -125,10 +140,7 @@ impl AcpClient {
                         } else if let Some(id) = v.get("id") {
                             // response to one of ours
                             let key = id_key(id);
-                            let sender = pending
-                                .lock()
-                                .ok()
-                                .and_then(|mut p| p.remove(&key));
+                            let sender = pending.lock().ok().and_then(|mut p| p.remove(&key));
                             if let Some(sender) = sender {
                                 let _ = sender.send(v);
                             }
@@ -137,12 +149,14 @@ impl AcpClient {
                     // drain pending + signal eof
                     if let Ok(mut p) = pending.lock() {
                         for (_, s) in p.drain() {
-                            let _ = s.send(json!({"error":{"code":-32000,"message":"agent stdout EOF"}}));
+                            let _ = s.send(
+                                json!({"error":{"code":-32000,"message":"agent stdout EOF"}}),
+                            );
                         }
                     }
                     let _ = tx.send(Wire::Eof);
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
         let stderr_ring = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING + 1)));
@@ -182,10 +196,9 @@ impl AcpClient {
             let s = v.to_string();
             eprintln!("[acp->] {}", &s[..s.len().min(300)]);
         }
-        let mut guard = self
-            .stdin
-            .lock()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin lock poisoned"))?;
+        let mut guard = self.stdin.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin lock poisoned")
+        })?;
         let mut buf = serde_json::to_vec(v).map_err(std::io::Error::other)?;
         buf.push(b'\n');
         guard.write_all(&buf)?;
@@ -194,13 +207,31 @@ impl AcpClient {
 
     /// Send a request; returns the response's raw message. Caller matches
     /// on `result` / `error`. `rx_timeout` bounds the wait.
-    pub fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        self.call_failure(method, params, timeout)
+            .map_err(|f| f.message)
+    }
+
+    /// [`AcpClient::call`] that keeps the JSON-RPC error code, so a driver
+    /// can tell a method-not-found (-32601) from a transport failure
+    /// without matching on message text.
+    pub fn call_failure(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcFailure> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = mpsc::sync_channel::<Value>(1);
         self.pending
             .lock()
-            .map_err(|_| "pending lock".to_string())?
+            .map_err(|_| RpcFailure::new(None, "pending lock".to_string()))?
             .insert(id.to_string(), tx);
         let req = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         if let Err(e) = self.write_line(&req) {
@@ -208,7 +239,7 @@ impl AcpClient {
                 .lock()
                 .ok()
                 .and_then(|mut p| p.remove(&id.to_string()));
-            return Err(format!("write {method}: {e}"));
+            return Err(RpcFailure::new(None, format!("write {method}: {e}")));
         }
         let msg = match rx.recv_timeout(timeout) {
             Ok(m) => m,
@@ -217,10 +248,11 @@ impl AcpClient {
                     .lock()
                     .ok()
                     .and_then(|mut p| p.remove(&id.to_string()));
-                return Err(format!("{method} timed out"));
+                return Err(RpcFailure::new(None, format!("{method} timed out")));
             }
         };
         if let Some(err) = msg.get("error") {
+            let code = err.get("code").and_then(Value::as_i64);
             let base = err.get("message").and_then(Value::as_str).unwrap_or("?");
             // Cursor/xAI put the useful string under data.details/data.message.
             let detail = match err.get("data") {
@@ -246,11 +278,18 @@ impl AcpClient {
             } else {
                 format!(" [stderr: {}]", tail.last().cloned().unwrap_or_default())
             };
-            return Err(format!(
-                "{method} failed: {}{}{}",
-                base,
-                if detail.is_empty() { String::new() } else { format!(" — {detail}") },
-                stderr_note,
+            return Err(RpcFailure::new(
+                code,
+                format!(
+                    "{method} failed: {}{}{}",
+                    base,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {detail}")
+                    },
+                    stderr_note,
+                ),
             ));
         }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
@@ -322,7 +361,12 @@ impl AcpClient {
         )
     }
 
-    pub fn session_load(&mut self, session_id: &str, cwd: &str, mcp_servers: Value) -> Result<Value, String> {
+    pub fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Value,
+    ) -> Result<Value, String> {
         self.call(
             "session/load",
             json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers}),
@@ -333,7 +377,12 @@ impl AcpClient {
     /// Kick off a prompt turn: registers the request then RETURNS the id —
     /// the caller streams `session/update` via `recv` until the matching
     /// response resolves (or a `_*/prompt_complete` notification wins).
-    pub fn prompt_begin(&mut self, session_id: &str, prompt: Value, meta: Value) -> Result<u64, String> {
+    pub fn prompt_begin(
+        &mut self,
+        session_id: &str,
+        prompt: Value,
+        meta: Value,
+    ) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
         let mut params = json!({"sessionId": session_id, "prompt": prompt});
@@ -341,7 +390,8 @@ impl AcpClient {
             params["_meta"] = meta;
         }
         let req = json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params});
-        self.write_line(&req).map_err(|e| format!("session/prompt write: {e}"))?;
+        self.write_line(&req)
+            .map_err(|e| format!("session/prompt write: {e}"))?;
         Ok(id)
     }
 
@@ -356,7 +406,12 @@ impl AcpClient {
     }
 
     /// Version that pre-registers then writes (race-free).
-    pub fn prompt(&mut self, session_id: &str, prompt: Value, meta: Value) -> Result<(u64, Receiver<Value>), String> {
+    pub fn prompt(
+        &mut self,
+        session_id: &str,
+        prompt: Value,
+        meta: Value,
+    ) -> Result<(u64, Receiver<Value>), String> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = mpsc::sync_channel::<Value>(1);
@@ -370,7 +425,10 @@ impl AcpClient {
         }
         let req = json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":params});
         if let Err(e) = self.write_line(&req) {
-            self.pending.lock().ok().and_then(|mut p| p.remove(&id.to_string()));
+            self.pending
+                .lock()
+                .ok()
+                .and_then(|mut p| p.remove(&id.to_string()));
             return Err(format!("session/prompt write: {e}"));
         }
         Ok((id, rx))
@@ -380,16 +438,38 @@ impl AcpClient {
         let _ = self.notify("session/cancel", json!({"sessionId": session_id}));
     }
 
-    pub fn set_model(&mut self, session_id: &str, model_id: &str, meta: Value) -> Result<(), String> {
+    pub fn set_model(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+        meta: Value,
+    ) -> Result<(), String> {
+        self.set_model_failure(session_id, model_id, meta)
+            .map_err(|f| f.message)
+    }
+
+    /// [`AcpClient::set_model`] that keeps the error code: an unusable
+    /// model id comes back as a JSON-RPC error the caller may classify.
+    pub fn set_model_failure(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+        meta: Value,
+    ) -> Result<(), RpcFailure> {
         let mut params = json!({"sessionId": session_id, "modelId": model_id});
         if !meta.is_null() {
             params["_meta"] = meta;
         }
-        self.call("session/set_model", params, Duration::from_secs(15))?;
+        self.call_failure("session/set_model", params, Duration::from_secs(15))?;
         Ok(())
     }
 
-    pub fn set_config_option(&mut self, session_id: &str, config_id: &str, value: Value) -> Result<(), String> {
+    pub fn set_config_option(
+        &mut self,
+        session_id: &str,
+        config_id: &str,
+        value: Value,
+    ) -> Result<(), String> {
         self.call(
             "session/set_config_option",
             json!({"sessionId": session_id, "configId": config_id, "value": value}),
@@ -409,7 +489,12 @@ impl AcpClient {
 
     /// Extension request the agent doesn't document (e.g. cursor's model
     /// list). Returns the raw result.
-    pub fn ext_call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    pub fn ext_call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         self.call(method, params, timeout)
     }
 

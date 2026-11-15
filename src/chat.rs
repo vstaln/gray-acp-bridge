@@ -64,10 +64,7 @@ pub fn split_model_overrides(model: &str) -> (String, Vec<(String, String)>) {
 
 fn item_type(item: &Value) -> &str {
     match item.get("type").and_then(Value::as_str) {
-        Some(t) => match t {
-            // Role-tagged messages in Responses input carry no `type`.
-            _ => t,
-        },
+        Some(t) => t,
         None if item.get("role").is_some() => "message",
         None => "",
     }
@@ -110,10 +107,7 @@ pub fn item_to_transcript_pub(item: &Value) -> Option<String> {
 fn item_to_transcript(item: &Value) -> Option<String> {
     match item_type(item) {
         "message" => {
-            let role = item
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
+            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let text = message_text(item);
             if text.trim().is_empty() {
                 return None;
@@ -131,17 +125,19 @@ fn item_to_transcript(item: &Value) -> Option<String> {
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            Some(format!("Assistant called tool {name} with arguments: {args}"))
+            Some(format!(
+                "Assistant called tool {name} with arguments: {args}"
+            ))
         }
         "function_call_output" => {
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
-            let output = item.get("output").map(|o| match o {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            }).unwrap_or_default();
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("?");
+            let output = item
+                .get("output")
+                .map(|o| match o {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
             Some(format!("Tool result for {call_id}: {output}"))
         }
         _ => None,
@@ -299,10 +295,13 @@ pub fn split_tail(turn: &mut PreparedTurn) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let output = item.get("output").map(|o| match o {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            }).unwrap_or_default();
+            let output = item
+                .get("output")
+                .map(|o| match o {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
             outputs.push((call_id, output));
         } else if let Some(text) = item_to_transcript(item) {
             let mut t = text;
@@ -334,9 +333,17 @@ pub struct TurnResult {
 
 #[derive(Clone)]
 pub enum OutItem {
-    Message { text: String },
-    Reasoning { text: String },
-    FunctionCall { call_id: String, name: String, arguments: String },
+    Message {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -353,7 +360,10 @@ impl Usage {
         // ACP Usage: {inputTokens, outputTokens, totalTokens?, ...} —
         // tolerate snake_case and nested variants.
         let get = |k1: &str, k2: &str| {
-            v.get(k1).or_else(|| v.get(k2)).and_then(Value::as_u64).unwrap_or(0)
+            v.get(k1)
+                .or_else(|| v.get(k2))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
         };
         let input = get("inputTokens", "input_tokens");
         let output = get("outputTokens", "output_tokens");
@@ -395,8 +405,7 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
             "created_at": now_secs(), "status": "in_progress",
             "model": model, "output": []}
     })));
-    let mut index = 0usize;
-    for item in &r.items {
+    for (index, item) in r.items.iter().enumerate() {
         match item {
             OutItem::Message { text } => {
                 let item_id = format!("msg_{response_id}_{index}");
@@ -433,7 +442,11 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
                         "summary": [{"type": "summary_text", "text": text}]}
                 })));
             }
-            OutItem::FunctionCall { call_id, name, arguments } => {
+            OutItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
                 let item_id = format!("fc_{response_id}_{index}");
                 out.extend_from_slice(&sse(&json!({
                     "type": "response.output_item.added", "output_index": index,
@@ -453,13 +466,16 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
                 })));
             }
         }
-        index += 1;
     }
     let usage = r.usage.as_ref().map(|u| {
         json!({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
             "total_tokens": u.total_tokens})
     });
-    let status = if r.suspended { "incomplete" } else { "completed" };
+    let status = if r.suspended {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let mut response = json!({
         "id": response_id, "object": "response",
         "created_at": now_secs(), "status": status, "model": model,
@@ -468,7 +484,9 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
     if let Some(u) = usage {
         response["usage"] = u;
     }
-    out.extend_from_slice(&sse(&json!({"type": "response.completed", "response": response})));
+    out.extend_from_slice(&sse(
+        &json!({"type": "response.completed", "response": response}),
+    ));
     out.extend_from_slice(b"data: [DONE]\n\n");
     out
 }
@@ -483,7 +501,11 @@ fn items_json(r: &TurnResult) -> Vec<Value> {
             OutItem::Reasoning { text } => json!({
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": text}]}),
-            OutItem::FunctionCall { call_id, name, arguments } => json!({
+            OutItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => json!({
                 "type": "function_call", "call_id": call_id, "name": name,
                 "arguments": arguments, "status": "completed"}),
         })
