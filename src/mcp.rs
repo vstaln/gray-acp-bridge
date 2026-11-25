@@ -176,7 +176,9 @@ fn handle_conn(s: &mut std::net::TcpStream, shared: &Arc<Mutex<Shared>>) {
         if line.is_empty() {
             break;
         }
-        let Some((name, v)) = line.split_once(':') else { continue };
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
         if name.eq_ignore_ascii_case("content-length") {
             len = v.trim().parse().unwrap_or(0);
         }
@@ -247,10 +249,7 @@ fn handle_rpc(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let tools = shared
-                .lock()
-                .map(|s| s.tools.clone())
-                .unwrap_or_default();
+            let tools = shared.lock().map(|s| s.tools.clone()).unwrap_or_default();
             Ok(json!({"tools": tools}))
         }
         "tools/call" => {
@@ -258,22 +257,16 @@ fn handle_rpc(
             // MCP-declared names are the bare host tool names — the
             // `mcp__gray__` namespace is the agent's display prefix; some
             // clients echo it back verbatim, so strip it if present.
-            let full_name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let full_name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let name = full_name.strip_prefix(TOOL_PREFIX).unwrap_or(full_name);
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(json!({}));
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             let known = {
                 shared
                     .lock()
                     .map(|s| {
-                        s.tools.iter().any(|t| {
-                            t.get("name").and_then(Value::as_str) == Some(name)
-                        })
+                        s.tools
+                            .iter()
+                            .any(|t| t.get("name").and_then(Value::as_str) == Some(name))
                     })
                     .unwrap_or(false)
             };

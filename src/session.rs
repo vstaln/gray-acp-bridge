@@ -81,6 +81,35 @@ pub trait Driver: Send + Sync {
         let _ = params;
         PermissionDecision::Deny
     }
+    fn stage(
+        &self,
+        stage: &std::path::Path,
+        mcp_url: &str,
+        tools: &[Value],
+        prep: &PreparedTurn,
+    ) -> Result<Option<Value>, String> {
+        let _ = (stage, mcp_url, tools, prep);
+        Ok(None)
+    }
+    fn session_meta(&self, init: &Value, system: &str) -> Option<Value> {
+        let _ = (init, system);
+        None
+    }
+    fn park_quiesce(&self) -> Duration {
+        PARK_QUIESCE
+    }
+    fn usage(&self, raw: &Value) -> Option<chat::Usage> {
+        chat::Usage::from_acp(raw)
+    }
+    fn turn_outcome(
+        &self,
+        stage: &std::path::Path,
+        model: &str,
+        outcome: Result<(), &str>,
+    ) -> bool {
+        let _ = (stage, model, outcome);
+        false
+    }
 }
 
 pub enum PermissionDecision {
@@ -112,6 +141,8 @@ pub struct Session {
     prompt_seq: u64,
     last_used: Instant,
     prior_cut: bool,
+    system_in_meta: bool,
+    images: bool,
     _stage: tempfile::TempDir,
 }
 
@@ -147,13 +178,13 @@ impl Pool {
 
 /// The full relay turn: `body` is the raw Responses request bytes.
 /// Returns the complete SSE byte stream.
-pub fn run_turn(
-    pool: &Arc<Pool>,
-    raw: &[u8],
-    cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
+pub fn run_turn(pool: &Arc<Pool>, raw: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, String> {
     let body: Value = serde_json::from_slice(raw).map_err(|e| format!("bad request json: {e}"))?;
-    let model_hint = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let model_hint = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut prep = chat::prepare_turn(&body, &model_hint)?;
 
     let mut guard = pool.sessions.lock().map_err(|_| "pool lock".to_string())?;
@@ -188,12 +219,9 @@ pub fn run_turn(
             if s.model != prep.model || s.mid_turn {
                 continue;
             }
-            if let Ok((t, _undelivered)) = chat::continuation(
-                &s.absorbed,
-                &s.reply_call_ids,
-                &s.reply_text,
-                &prep.input,
-            ) {
+            if let Ok((t, _undelivered)) =
+                chat::continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &prep.input)
+            {
                 tail = t.to_vec();
                 chosen = Some(key.clone());
                 break;
@@ -230,10 +258,15 @@ pub fn run_turn(
     session.last_used = Instant::now();
     session.mcp.set_tools(to_mcp_tools(&prep.tools));
     prep.tail = tail;
-    chat::split_tail(&mut prep);
+    chat::split_tail_with(&mut prep, session.images);
 
     let result = drive(session, &*pool.driver, &mut prep, cancel, fresh);
-    if session.dead {
+    let discard = pool.driver.turn_outcome(
+        session._stage.path(),
+        &prep.model,
+        result.as_ref().map(|_| ()).map_err(String::as_str),
+    );
+    if session.dead || discard {
         guard.remove(&key);
     }
     result.map(|r| {
@@ -250,20 +283,17 @@ fn chat_item_type(i: &Value) -> &str {
     }
 }
 
-fn spawn_session(
-    driver: &dyn Driver,
-    prep: &PreparedTurn,
-) -> Result<Session, String> {
+fn spawn_session(driver: &dyn Driver, prep: &PreparedTurn) -> Result<Session, String> {
     let mcp = McpPark::start()?;
     let stage = tempfile::TempDir::new().map_err(|e| format!("stage dir: {e}"))?;
+    let tools = to_mcp_tools(&prep.tools);
+    mcp.set_tools(tools.clone());
+    let mcp_servers = driver
+        .stage(stage.path(), &mcp.url, &tools, prep)?
+        .unwrap_or_else(|| json!([mcp.server_entry("gray")]));
     let spec = driver.spawn_spec(stage.path());
-    let mut client = AcpClient::spawn(&spec).map_err(|e| {
-        format!(
-            "spawn {} {}: {e}",
-            spec.command,
-            spec.args.join(" ")
-        )
-    })?;
+    let mut client = AcpClient::spawn(&spec)
+        .map_err(|e| format!("spawn {} {}: {e}", spec.command, spec.args.join(" ")))?;
     let caps = driver.client_capabilities();
     let (name, ver) = driver.client_info();
     let init = client
@@ -274,10 +304,23 @@ fn spawn_session(
             .authenticate(method)
             .map_err(|e| format!("authenticate: {e}"))?;
     }
-    let mcp_servers = json!([mcp.server_entry("gray")]);
-    let mcp = mcp;
+    let meta_system = if prep.system.is_empty() {
+        guard::ONE_TURN_RULE.to_string()
+    } else {
+        format!("{}\n\n{}", prep.system, guard::ONE_TURN_RULE)
+    };
+    let meta = driver.session_meta(&init, &meta_system);
+    let system_in_meta = meta.is_some();
+    let images = init
+        .pointer("/agentCapabilities/promptCapabilities/image")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let sess = client
-        .session_new(&stage.path().to_string_lossy(), mcp_servers)
+        .session_new_with_meta(
+            &stage.path().to_string_lossy(),
+            mcp_servers,
+            meta.unwrap_or(Value::Null),
+        )
         .map_err(|e| format!("session/new: {e}"))?;
     let session_id = sess
         .get("sessionId")
@@ -289,7 +332,14 @@ fn spawn_session(
         let _ = client.set_mode(&session_id, mode);
     }
     if !prep.model.is_empty() {
-        driver.apply_model(&mut client, &session_id, &sess, &prep.model, prep.effort.as_deref(), &prep.overrides)?;
+        driver.apply_model(
+            &mut client,
+            &session_id,
+            &sess,
+            &prep.model,
+            prep.effort.as_deref(),
+            &prep.overrides,
+        )?;
     }
     let _ = init;
     Ok(Session {
@@ -306,6 +356,8 @@ fn spawn_session(
         prompt_seq: 0,
         last_used: Instant::now(),
         prior_cut: false,
+        system_in_meta,
+        images,
         _stage: stage,
     })
 }
@@ -316,13 +368,10 @@ pub fn to_mcp_tools(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
         .filter_map(|t| {
-            let (name, desc, params) = if t.get("type").and_then(Value::as_str) == Some("function") {
+            let (name, desc, params) = if t.get("type").and_then(Value::as_str) == Some("function")
+            {
                 // Responses shape: {type:"function", name, description, parameters}
-                (
-                    t.get("name"),
-                    t.get("description"),
-                    t.get("parameters"),
-                )
+                (t.get("name"), t.get("description"), t.get("parameters"))
             } else {
                 // already MCP-ish?
                 (
@@ -335,7 +384,9 @@ pub fn to_mcp_tools(tools: &[Value]) -> Vec<Value> {
             if name.is_empty() || name.len() > 50 {
                 return None;
             }
-            let mut schema = params.cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}));
+            let mut schema = params
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
             normalize_schema(&mut schema);
             Some(json!({
                 "name": name,
@@ -406,10 +457,13 @@ fn drive_inner(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let output = item.get("output").map(|o| match o {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                }).unwrap_or_default();
+                let output = item
+                    .get("output")
+                    .map(|o| match o {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
                 if let Some(p) = session.parked.remove(&call_id) {
                     p.call.resolve(output);
                     saw_output = true;
@@ -430,12 +484,17 @@ fn drive_inner(
         if std::mem::take(&mut session.prior_cut) && !fresh {
             prompt_blocks.push(json!({"type": "text", "text": guard::CUT_NOTE}));
         }
-        if fresh && !prep.system.is_empty() {
-            prompt_blocks.push(json!({"type": "text",
-                "text": format!("System instructions:\n{}\n\n{}", prep.system, guard::ONE_TURN_RULE)}));
-        } else if fresh {
-            prompt_blocks.push(json!({"type": "text",
-                "text": format!("System instructions:\n{}", guard::ONE_TURN_RULE)}));
+        if fresh && !session.system_in_meta {
+            let text = if prep.system.is_empty() {
+                format!("System instructions:\n{}", guard::ONE_TURN_RULE)
+            } else {
+                format!(
+                    "System instructions:\n{}\n\n{}",
+                    prep.system,
+                    guard::ONE_TURN_RULE
+                )
+            };
+            prompt_blocks.push(json!({"type": "text", "text": text}));
         }
         if prep.tail_prompt.is_empty() && prep.outputs.is_empty() && !fresh {
             // Nothing new — nudge the model rather than send an empty prompt.
@@ -459,7 +518,11 @@ fn drive_inner(
             let meta = driver.prompt_meta(session.prompt_seq);
             let (_id, rx) = session
                 .client
-                .prompt(&session.session_id.clone(), Value::Array(prompt_blocks), meta)
+                .prompt(
+                    &session.session_id.clone(),
+                    Value::Array(prompt_blocks),
+                    meta,
+                )
                 .map_err(|e| format!("session/prompt: {e}"))?;
             prompt_rx = Some(rx);
             session.mid_turn = true;
@@ -500,13 +563,16 @@ fn drive_inner(
         // Parked MCP calls arrived?
         for pending in session.mcp.drain() {
             if turn_guard.cut().is_some() {
-                pending.fail("reply was cut at a fabricated transcript record; this call never ran");
+                pending
+                    .fail("reply was cut at a fabricated transcript record; this call never ran");
                 continue;
             }
             flush_text(&mut result, &mut text_acc);
             let (call_id, name) = (pending.call_id.clone(), pending.name.clone());
             let arguments = pending.arguments.to_string();
-            session.parked.insert(call_id.clone(), Parked { call: pending });
+            session
+                .parked
+                .insert(call_id.clone(), Parked { call: pending });
             result.items.push(OutItem::FunctionCall {
                 call_id,
                 name,
@@ -518,7 +584,7 @@ fn drive_inner(
         // Suspension check: parked calls + quiesced stream → end turn.
         if !session.parked.is_empty() {
             match quiesce {
-                Some(t) if t.elapsed() >= PARK_QUIESCE => {
+                Some(t) if t.elapsed() >= driver.park_quiesce() => {
                     flush_text(&mut result, &mut text_acc);
                     flush_thought(&mut result, &mut thought_acc);
                     result.suspended = true;
@@ -549,7 +615,11 @@ fn drive_inner(
                         .and_then(Value::as_str)
                         .unwrap_or("end_turn")
                         .to_string();
-                    if let Some(u) = msg.get("result").and_then(|r| r.get("usage")).and_then(chat::Usage::from_acp) {
+                    if let Some(u) = msg
+                        .get("result")
+                        .and_then(|r| r.get("usage"))
+                        .and_then(|u| driver.usage(u))
+                    {
                         result.usage = Some(u);
                     }
                     result.stop_reason = stop;
@@ -607,14 +677,25 @@ fn drive_inner(
             Wire::Bad => {}
             Wire::Notification { method, params } => {
                 if method == "session/update" {
-                    let cut = handle_update(&params, &mut result, &mut text_acc, &mut thought_acc,
-                                  &flush_text, &flush_thought, turn_guard);
+                    let cut = handle_update(
+                        &params,
+                        &mut result,
+                        &mut text_acc,
+                        &mut thought_acc,
+                        &flush_text,
+                        &flush_thought,
+                        turn_guard,
+                    );
                     if let Some(m) = cut {
                         eprintln!(
                             "acp-bridge: reply cut at fabricated {} record (offset {}); {}",
                             guard::marker_name(m),
                             text_acc.len(),
-                            if session.parked.is_empty() { "upstream cancelled" } else { "draining (calls parked)" }
+                            if session.parked.is_empty() {
+                                "upstream cancelled"
+                            } else {
+                                "draining (calls parked)"
+                            }
                         );
                         session.prior_cut = true;
                         if session.parked.is_empty() {
@@ -675,25 +756,28 @@ fn handle_agent_request(
     params: &Value,
 ) {
     match method {
-        "session/request_permission" => {
-            match driver.permission_option(params) {
-                PermissionDecision::Allow(option_id) => {
-                    let _ = session.client.respond(
-                        id,
-                        json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
-                    );
-                }
-                PermissionDecision::Deny => {
-                    let _ = session.client.respond(
-                        id,
-                        json!({"outcome": {"outcome": "cancelled"}}),
-                    );
-                }
+        "session/request_permission" => match driver.permission_option(params) {
+            PermissionDecision::Allow(option_id) => {
+                let _ = session.client.respond(
+                    id,
+                    json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+                );
             }
-        }
-        "fs/read_text_file" | "fs/readTextFile" | "fs/write_text_file"
-        | "fs/writeTextFile" | "terminal/create" | "terminal/output"
-        | "terminal/release" | "terminal/kill" | "terminal/wait_for_exit" => {
+            PermissionDecision::Deny => {
+                let _ = session
+                    .client
+                    .respond(id, json!({"outcome": {"outcome": "cancelled"}}));
+            }
+        },
+        "fs/read_text_file"
+        | "fs/readTextFile"
+        | "fs/write_text_file"
+        | "fs/writeTextFile"
+        | "terminal/create"
+        | "terminal/output"
+        | "terminal/release"
+        | "terminal/kill"
+        | "terminal/wait_for_exit" => {
             let _ = session
                 .client
                 .respond_error(id, -32601, "client capability not supported");
@@ -721,7 +805,10 @@ fn handle_update(
     turn_guard: &mut TurnGuard,
 ) -> Option<&'static str> {
     let update = params.get("update")?;
-    let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if turn_guard.cut().is_some() && kind != "usage_update" {
         return None;
     }
@@ -756,8 +843,12 @@ fn handle_update(
                 }
             }
         }
-        "plan" | "available_commands_update" | "current_mode_update"
-        | "config_option_update" | "session_info_update" | "user_message_chunk" => {}
+        "plan"
+        | "available_commands_update"
+        | "current_mode_update"
+        | "config_option_update"
+        | "session_info_update"
+        | "user_message_chunk" => {}
         _ => {}
     }
     None

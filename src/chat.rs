@@ -110,10 +110,7 @@ pub fn item_to_transcript_pub(item: &Value) -> Option<String> {
 fn item_to_transcript(item: &Value) -> Option<String> {
     match item_type(item) {
         "message" => {
-            let role = item
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
+            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let text = message_text(item);
             if text.trim().is_empty() {
                 return None;
@@ -131,17 +128,19 @@ fn item_to_transcript(item: &Value) -> Option<String> {
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            Some(format!("Assistant called tool {name} with arguments: {args}"))
+            Some(format!(
+                "Assistant called tool {name} with arguments: {args}"
+            ))
         }
         "function_call_output" => {
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
-            let output = item.get("output").map(|o| match o {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            }).unwrap_or_default();
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("?");
+            let output = item
+                .get("output")
+                .map(|o| match o {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
             Some(format!("Tool result for {call_id}: {output}"))
         }
         _ => None,
@@ -290,6 +289,39 @@ pub fn reply_signature(r: &TurnResult) -> (Vec<String>, String) {
 /// Split the tail into parked-call answers + prompt blocks. `tail` here is
 /// the slice `continuation` returned (fresh conversation: whole input).
 pub fn split_tail(turn: &mut PreparedTurn) {
+    split_tail_with(turn, false);
+}
+
+fn image_blocks(item: &Value) -> Vec<Value> {
+    let Some(parts) = item.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.get("type").and_then(Value::as_str),
+                Some("input_image" | "image_url")
+            )
+        })
+        .filter_map(|p| {
+            let url = p
+                .get("image_url")
+                .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Value::as_str)))?;
+            let (head, data) = url.strip_prefix("data:")?.split_once(',')?;
+            let mime = head.strip_suffix(";base64")?;
+            if !matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) {
+                return None;
+            }
+            Some(json!({"type": "image", "mimeType": mime, "data": data}))
+        })
+        .collect()
+}
+
+pub fn split_tail_with(turn: &mut PreparedTurn, images: bool) {
     let mut outputs = Vec::new();
     let mut prompt = Vec::new();
     for item in &turn.tail {
@@ -299,10 +331,13 @@ pub fn split_tail(turn: &mut PreparedTurn) {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let output = item.get("output").map(|o| match o {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            }).unwrap_or_default();
+            let output = item
+                .get("output")
+                .map(|o| match o {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
             outputs.push((call_id, output));
         } else if let Some(text) = item_to_transcript(item) {
             let mut t = text;
@@ -315,6 +350,9 @@ pub fn split_tail(turn: &mut PreparedTurn) {
                 t.push_str("\n[truncated]");
             }
             prompt.push(json!({"type": "text", "text": t}));
+            if images && item_type(item) == "message" {
+                prompt.extend(image_blocks(item));
+            }
         }
     }
     turn.outputs = outputs;
@@ -334,9 +372,17 @@ pub struct TurnResult {
 
 #[derive(Clone)]
 pub enum OutItem {
-    Message { text: String },
-    Reasoning { text: String },
-    FunctionCall { call_id: String, name: String, arguments: String },
+    Message {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -353,7 +399,10 @@ impl Usage {
         // ACP Usage: {inputTokens, outputTokens, totalTokens?, ...} —
         // tolerate snake_case and nested variants.
         let get = |k1: &str, k2: &str| {
-            v.get(k1).or_else(|| v.get(k2)).and_then(Value::as_u64).unwrap_or(0)
+            v.get(k1)
+                .or_else(|| v.get(k2))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
         };
         let input = get("inputTokens", "input_tokens");
         let output = get("outputTokens", "output_tokens");
@@ -433,7 +482,11 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
                         "summary": [{"type": "summary_text", "text": text}]}
                 })));
             }
-            OutItem::FunctionCall { call_id, name, arguments } => {
+            OutItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
                 let item_id = format!("fc_{response_id}_{index}");
                 out.extend_from_slice(&sse(&json!({
                     "type": "response.output_item.added", "output_index": index,
@@ -456,10 +509,18 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
         index += 1;
     }
     let usage = r.usage.as_ref().map(|u| {
-        json!({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
-            "total_tokens": u.total_tokens})
+        let mut usage = json!({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+            "total_tokens": u.total_tokens});
+        if let Some(cached) = u.extra.get("cached_tokens").and_then(Value::as_u64) {
+            usage["input_tokens_details"] = json!({"cached_tokens": cached});
+        }
+        usage
     });
-    let status = if r.suspended { "incomplete" } else { "completed" };
+    let status = if r.suspended {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let mut response = json!({
         "id": response_id, "object": "response",
         "created_at": now_secs(), "status": status, "model": model,
@@ -468,7 +529,9 @@ pub fn fold_result(r: &TurnResult, model: &str, response_id: &str) -> Vec<u8> {
     if let Some(u) = usage {
         response["usage"] = u;
     }
-    out.extend_from_slice(&sse(&json!({"type": "response.completed", "response": response})));
+    out.extend_from_slice(&sse(
+        &json!({"type": "response.completed", "response": response}),
+    ));
     out.extend_from_slice(b"data: [DONE]\n\n");
     out
 }
@@ -483,7 +546,11 @@ fn items_json(r: &TurnResult) -> Vec<Value> {
             OutItem::Reasoning { text } => json!({
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": text}]}),
-            OutItem::FunctionCall { call_id, name, arguments } => json!({
+            OutItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => json!({
                 "type": "function_call", "call_id": call_id, "name": name,
                 "arguments": arguments, "status": "completed"}),
         })
